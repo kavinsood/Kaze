@@ -5,11 +5,17 @@ import AVFoundation
 
 // MARK: - Onboarding View
 
+#if false
 struct OnboardingView: View {
     @State private var currentStep = 0
     @State private var hotkeyShortcut = HotkeyShortcut.default
-    @AppStorage(AppPreferenceKey.transcriptionEngine) private var engineRaw = TranscriptionEngine.parakeet.rawValue
+    @AppStorage(AppPreferenceKey.transcriptionEngine) private var engineRaw = TranscriptionEngine.whisper.rawValue
     @AppStorage(AppPreferenceKey.hotkeyMode) private var hotkeyModeRaw = HotkeyMode.holdToTalk.rawValue
+    @AppStorage(AppPreferenceKey.cloudflareAccountID) private var cloudflareAccountID = ""
+    @AppStorage(AppPreferenceKey.transcriptionLanguage) private var transcriptionLanguage = "en"
+    @State private var cloudflareAPITokenInput = ""
+    @State private var cloudflareAPITokenSaved = false
+    @State private var cloudflareAPITokenSaveFailed = false
 
     // Permission states
     @State private var microphoneGranted = false
@@ -33,7 +39,7 @@ struct OnboardingView: View {
     }
 
     private var selectedEngine: TranscriptionEngine {
-        TranscriptionEngine(rawValue: engineRaw) ?? .parakeet
+        TranscriptionEngine(rawValue: engineRaw) ?? .whisper
     }
 
     /// Whether the engine step requires a model download and the model isn't already downloaded.
@@ -94,12 +100,7 @@ struct OnboardingView: View {
                 if currentStep > 0 && currentStep < totalSteps - 1 {
                     Button("Back") {
                         hotkeyRecorder.stop()
-                        if currentStep == 5 && !selectedEngine.requiresModelDownload {
-                            // Skipped model download step, go back to engine selection.
-                            currentStep = 3
-                        } else {
-                            currentStep -= 1
-                        }
+                        currentStep -= 1
                     }
                     .controlSize(.regular)
                 }
@@ -110,14 +111,6 @@ struct OnboardingView: View {
                         if currentStep == 2 {
                             // Save hotkey before advancing
                             hotkeyShortcut.saveToDefaults()
-                        }
-                        if currentStep == 3 {
-                            // Moving from engine step to model download step
-                            // If engine doesn't require download, skip model step
-                            if !selectedEngine.requiresModelDownload {
-                                currentStep = 5 // Skip to done
-                                return
-                            }
                         }
                         currentStep += 1
                     }
@@ -141,6 +134,7 @@ struct OnboardingView: View {
         }
         .frame(width: 480, height: 540)
         .onAppear {
+            cloudflareAPITokenSaved = KeychainManager.hasCloudflareAPIToken()
             hotkeyRecorder.onShortcutRecorded = { shortcut in
                 hotkeyShortcut = shortcut
             }
@@ -463,13 +457,13 @@ struct OnboardingView: View {
             Text("Choose an Engine")
                 .font(.title2.bold())
 
-            Text("You can change this later in Settings.\nAI engines require a one-time model download.")
+            Text("This build uses Cloudflare-hosted Whisper Large V3 Turbo.\nNo speech model runs on your Mac.")
                 .font(.body)
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
 
             VStack(spacing: 4) {
-                // Order: Parakeet first (recommended), then others
+                // This fork intentionally offers Cloudflare-hosted Whisper only.
                 ForEach(TranscriptionEngine.onboardingOrder, id: \.self) { engine in
                     Button {
                         engineRaw = engine.rawValue
@@ -531,14 +525,14 @@ struct OnboardingView: View {
         VStack(spacing: 16) {
             Spacer()
 
-            Image(systemName: "arrow.down.circle")
+            Image(systemName: "cloud.fill")
                 .font(.system(size: 40))
                 .foregroundStyle(.secondary)
 
-            Text("Download Model")
+            Text("Connect Cloudflare")
                 .font(.title2.bold())
 
-            Text("\(selectedEngine.title) requires a one-time model download.\nThis only needs to happen once.")
+            Text("Enter credentials for Cloudflare Workers AI.\nYour API token is stored in macOS Keychain.")
                 .font(.body)
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
@@ -560,10 +554,59 @@ struct OnboardingView: View {
         case .dictation:
             onboardingAppleSpeechStatus
         case .whisper:
-            onboardingWhisperStatus
+            onboardingCloudflareStatus
         case .parakeet:
             onboardingFluidAudioStatus(manager: parakeetModelManager, model: .parakeet)
         }
+    }
+
+    private var onboardingCloudflareStatus: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            TextField("Cloudflare Account ID", text: $cloudflareAccountID)
+                .textFieldStyle(.roundedBorder)
+                .font(.system(size: 11, design: .monospaced))
+
+            HStack(spacing: 8) {
+                SecureField(
+                    cloudflareAPITokenSaved ? "Token saved in Keychain" : "Cloudflare API token",
+                    text: $cloudflareAPITokenInput
+                )
+                .textFieldStyle(.roundedBorder)
+                .font(.system(size: 11, design: .monospaced))
+                .onChange(of: cloudflareAPITokenInput) {
+                    cloudflareAPITokenSaveFailed = false
+                }
+
+                Button("Save") {
+                    let token = cloudflareAPITokenInput
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                    guard !token.isEmpty else { return }
+                    if KeychainManager.saveCloudflareAPIToken(token) {
+                        cloudflareAPITokenInput = ""
+                        cloudflareAPITokenSaved = true
+                        cloudflareAPITokenSaveFailed = false
+                    } else {
+                        cloudflareAPITokenSaveFailed = true
+                    }
+                }
+                .disabled(cloudflareAPITokenInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            }
+
+            TextField("Language hint (for example, en)", text: $transcriptionLanguage)
+                .textFieldStyle(.roundedBorder)
+
+            if cloudflareAPITokenSaveFailed {
+                Label("The API token could not be saved to Keychain.", systemImage: "exclamationmark.triangle.fill")
+                    .foregroundStyle(.red)
+            } else if isModelReady {
+                Label("Cloudflare is configured", systemImage: "checkmark.circle.fill")
+                    .foregroundStyle(.green)
+            } else {
+                Text("Use a 32-character Account ID and an API token with Workers AI Read permission.")
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .font(.caption)
     }
 
     @ViewBuilder
@@ -803,5 +846,246 @@ private struct OnboardingKeyCapView: View {
                 RoundedRectangle(cornerRadius: 5, style: .continuous)
                     .strokeBorder(.quaternary, lineWidth: 1)
             )
+    }
+}
+#endif
+
+struct OnboardingView: View {
+    @State private var step = 0
+    @State private var microphoneGranted = false
+    @State private var accessibilityGranted = false
+    @State private var shortcut = HotkeyShortcut.default
+    @State private var tokenInput = ""
+    @State private var tokenSaved = false
+    @State private var tokenSaveFailed = false
+    @AppStorage(AppPreferenceKey.cloudflareAccountID) private var accountID = ""
+    @AppStorage(AppPreferenceKey.transcriptionLanguage) private var language = "en"
+    @StateObject private var hotkeyRecorder = HotkeyShortcutRecorder()
+
+    let onComplete: () -> Void
+
+    private let stepCount = 5
+
+    private var cloudflareConfigured: Bool {
+        accountID.trimmingCharacters(in: .whitespacesAndNewlines)
+            .range(of: "^[A-Fa-f0-9]{32}$", options: .regularExpression) != nil
+            && tokenSaved
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            Group {
+                switch step {
+                case 0: welcome
+                case 1: permissions
+                case 2: hotkey
+                case 3: cloudflare
+                default: done
+                }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+
+            Divider()
+
+            HStack {
+                HStack(spacing: 6) {
+                    ForEach(0..<stepCount, id: \.self) { index in
+                        Circle()
+                            .fill(index == step ? Color.accentColor : Color.secondary.opacity(0.3))
+                            .frame(width: 6, height: 6)
+                    }
+                }
+                Spacer()
+                if step > 0 && step < stepCount - 1 {
+                    Button("Back") { step -= 1 }
+                }
+                if step < stepCount - 1 {
+                    Button("Continue") {
+                        if step == 2 { shortcut.saveToDefaults() }
+                        step += 1
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(step == 1 && (!microphoneGranted || !accessibilityGranted)
+                        || step == 3 && !cloudflareConfigured)
+                } else {
+                    Button("Start Dictating") {
+                        UserDefaults.standard.set(true, forKey: AppPreferenceKey.hasCompletedOnboarding)
+                        onComplete()
+                    }
+                    .buttonStyle(.borderedProminent)
+                }
+            }
+            .padding(20)
+        }
+        .onAppear {
+            tokenSaved = KeychainManager.hasCloudflareAPIToken()
+            refreshPermissions()
+            shortcut = HotkeyShortcut.loadFromDefaults()
+            hotkeyRecorder.onShortcutRecorded = { newShortcut in
+                shortcut = newShortcut
+            }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+            refreshPermissions()
+        }
+        .onDisappear { hotkeyRecorder.stop() }
+    }
+
+    private var welcome: some View {
+        VStack(spacing: 18) {
+            Image(systemName: "waveform.circle.fill")
+                .font(.system(size: 72))
+                .foregroundStyle(.tint)
+            Text("Welcome to Kaze")
+                .font(.largeTitle.bold())
+            Text("Fast macOS dictation using Cloudflare-hosted Whisper Large V3 Turbo.")
+                .multilineTextAlignment(.center)
+                .foregroundStyle(.secondary)
+                .frame(maxWidth: 360)
+        }
+        .padding(32)
+    }
+
+    private var permissions: some View {
+        VStack(alignment: .leading, spacing: 20) {
+            Text("Permissions")
+                .font(.title.bold())
+            Text("Kaze needs the microphone to hear you and Accessibility access to paste the transcript into the active app.")
+                .foregroundStyle(.secondary)
+
+            permissionRow(
+                title: "Microphone",
+                granted: microphoneGranted,
+                actionTitle: "Allow"
+            ) {
+                Task {
+                    microphoneGranted = await AVCaptureDevice.requestAccess(for: .audio)
+                }
+            }
+
+            permissionRow(
+                title: "Accessibility",
+                granted: accessibilityGranted,
+                actionTitle: "Open Settings"
+            ) {
+                requestAccessibilityAccess()
+            }
+
+            Button("Refresh") { refreshPermissions() }
+
+            Text("Enable Kaze Cloud in Privacy & Security → Accessibility, then return here. Move the app to Applications first so the permission remains tied to a stable location.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: 380)
+        .padding(32)
+    }
+
+    private func permissionRow(
+        title: String,
+        granted: Bool,
+        actionTitle: String,
+        action: @escaping () -> Void
+    ) -> some View {
+        HStack {
+            Label(title, systemImage: granted ? "checkmark.circle.fill" : "circle")
+                .foregroundStyle(granted ? .green : .primary)
+            Spacer()
+            if !granted { Button(actionTitle, action: action) }
+        }
+        .padding(12)
+        .background(.quaternary.opacity(0.5), in: RoundedRectangle(cornerRadius: 10))
+    }
+
+    private var hotkey: some View {
+        VStack(spacing: 20) {
+            Text("Choose a Shortcut")
+                .font(.title.bold())
+            Text("Hold the shortcut while speaking, then release it to transcribe and paste.")
+                .multilineTextAlignment(.center)
+                .foregroundStyle(.secondary)
+            Text(shortcut.displayTokens.joined(separator: " "))
+                .font(.system(size: 24, weight: .semibold, design: .rounded))
+                .padding(.horizontal, 18)
+                .padding(.vertical, 12)
+                .background(.quaternary.opacity(0.6), in: RoundedRectangle(cornerRadius: 10))
+            Button(hotkeyRecorder.isRecording ? "Press your shortcut…" : "Record Shortcut") {
+                if hotkeyRecorder.isRecording { hotkeyRecorder.stop() }
+                else { hotkeyRecorder.start() }
+            }
+            .buttonStyle(.borderedProminent)
+        }
+        .padding(32)
+    }
+
+    private var cloudflare: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Text("Connect Cloudflare")
+                .font(.title.bold())
+            Text("Enter your Cloudflare Account ID and a token made with Cloudflare's Workers AI API Token template. The token is stored in Keychain.")
+                .foregroundStyle(.secondary)
+
+            TextField("32-character Account ID", text: $accountID)
+                .textFieldStyle(.roundedBorder)
+                .font(.system(.body, design: .monospaced))
+            SecureField(tokenSaved ? "Token saved in Keychain" : "API token", text: $tokenInput)
+                .textFieldStyle(.roundedBorder)
+                .font(.system(.body, design: .monospaced))
+
+            HStack {
+                Button("Save Token") { saveToken() }
+                    .disabled(tokenInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                if tokenSaved {
+                    Label("Saved", systemImage: "checkmark.circle.fill")
+                        .foregroundStyle(.green)
+                }
+            }
+
+            TextField("Language hint (optional, e.g. en)", text: $language)
+                .textFieldStyle(.roundedBorder)
+            if tokenSaveFailed {
+                Label("The token could not be saved to Keychain.", systemImage: "exclamationmark.triangle.fill")
+                    .foregroundStyle(.red)
+            }
+        }
+        .frame(maxWidth: 400)
+        .padding(32)
+    }
+
+    private var done: some View {
+        VStack(spacing: 18) {
+            Image(systemName: "checkmark.circle.fill")
+                .font(.system(size: 68))
+                .foregroundStyle(.green)
+            Text("Ready to Dictate")
+                .font(.title.bold())
+            Text("Kaze records only while your shortcut is active, sends the audio to Whisper Large V3 Turbo on Cloudflare Workers AI, and pastes the returned text.")
+                .multilineTextAlignment(.center)
+                .foregroundStyle(.secondary)
+                .frame(maxWidth: 380)
+        }
+        .padding(32)
+    }
+
+    private func refreshPermissions() {
+        microphoneGranted = AVCaptureDevice.authorizationStatus(for: .audio) == .authorized
+        accessibilityGranted = AXIsProcessTrusted()
+    }
+
+    private func requestAccessibilityAccess() {
+        let options = ["AXTrustedCheckOptionPrompt": true] as CFDictionary
+        accessibilityGranted = AXIsProcessTrustedWithOptions(options)
+        guard !accessibilityGranted,
+              let settingsURL = URL(
+                string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"
+              ) else { return }
+        NSWorkspace.shared.open(settingsURL)
+    }
+
+    private func saveToken() {
+        let token = tokenInput.trimmingCharacters(in: .whitespacesAndNewlines)
+        tokenSaved = KeychainManager.saveCloudflareAPIToken(token)
+        tokenSaveFailed = !tokenSaved
+        if tokenSaved { tokenInput = "" }
     }
 }

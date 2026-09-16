@@ -44,12 +44,6 @@ class CustomWordsManager: ObservableObject {
         saveToDisk()
     }
 
-    /// All words joined as a prompt string for Whisper.
-    /// Whisper uses an initial text prompt to bias recognition toward these terms.
-    var whisperPrompt: String {
-        words.joined(separator: ", ")
-    }
-
     // MARK: - Persistence
 
     private func saveToDisk() {

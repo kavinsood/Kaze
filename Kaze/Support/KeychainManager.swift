@@ -4,33 +4,67 @@ import Security
 /// Manages secure storage of API keys in the macOS Keychain.
 enum KeychainManager {
 
-    private static let service = "com.fayazahmed.Kaze"
+    private static let service = "com.kavin.KazeCloud"
+    private static let cloudflareAPITokenAccount = "cloudflare-workers-ai-api-token"
 
-    /// Saves an API key for the given provider to the Keychain.
-    /// Overwrites any existing key for the same provider.
+    /// Saves the Cloudflare Workers AI API token to the Keychain.
+    /// Overwrites any token previously saved by Kaze.
     @discardableResult
-    static func saveAPIKey(_ key: String, for provider: CloudAIProvider) -> Bool {
-        let account = provider.keychainAccount
-        guard let data = key.data(using: .utf8) else { return false }
+    static func saveCloudflareAPIToken(_ token: String) -> Bool {
+        let normalizedToken = token.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalizedToken.isEmpty else { return false }
+        let saved = saveSecret(normalizedToken, account: cloudflareAPITokenAccount)
+        if saved {
+            NotificationCenter.default.post(name: .cloudflareConfigurationDidChange, object: nil)
+        }
+        return saved
+    }
 
-        // Delete any existing item first
-        deleteAPIKey(for: provider)
+    /// Retrieves the Cloudflare Workers AI API token from the Keychain.
+    static func getCloudflareAPIToken() -> String? {
+        getSecret(account: cloudflareAPITokenAccount)
+    }
+
+    /// Deletes the Cloudflare Workers AI API token from the Keychain.
+    @discardableResult
+    static func deleteCloudflareAPIToken() -> Bool {
+        let deleted = deleteSecret(account: cloudflareAPITokenAccount)
+        if deleted {
+            NotificationCenter.default.post(name: .cloudflareConfigurationDidChange, object: nil)
+        }
+        return deleted
+    }
+
+    /// Checks whether a Cloudflare Workers AI API token is stored.
+    static func hasCloudflareAPIToken() -> Bool {
+        getCloudflareAPIToken() != nil
+    }
+
+    private static func saveSecret(_ secret: String, account: String) -> Bool {
+        guard let data = secret.data(using: .utf8) else { return false }
 
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
             kSecAttrAccount as String: account,
+        ]
+        let attributes: [String: Any] = [
             kSecValueData as String: data,
             kSecAttrAccessible as String: kSecAttrAccessibleWhenUnlocked,
         ]
 
-        let status = SecItemAdd(query as CFDictionary, nil)
-        return status == errSecSuccess
+        let updateStatus = SecItemUpdate(query as CFDictionary, attributes as CFDictionary)
+        if updateStatus == errSecSuccess {
+            return true
+        }
+        guard updateStatus == errSecItemNotFound else {
+            return false
+        }
+
+        return SecItemAdd(query.merging(attributes) { _, new in new } as CFDictionary, nil) == errSecSuccess
     }
 
-    /// Retrieves the stored API key for the given provider.
-    static func getAPIKey(for provider: CloudAIProvider) -> String? {
-        let account = provider.keychainAccount
+    private static func getSecret(account: String) -> String? {
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
@@ -49,10 +83,8 @@ enum KeychainManager {
         return String(data: data, encoding: .utf8)
     }
 
-    /// Deletes the stored API key for the given provider.
     @discardableResult
-    static func deleteAPIKey(for provider: CloudAIProvider) -> Bool {
-        let account = provider.keychainAccount
+    private static func deleteSecret(account: String) -> Bool {
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
@@ -61,10 +93,5 @@ enum KeychainManager {
 
         let status = SecItemDelete(query as CFDictionary)
         return status == errSecSuccess || status == errSecItemNotFound
-    }
-
-    /// Checks whether an API key is stored for the given provider.
-    static func hasAPIKey(for provider: CloudAIProvider) -> Bool {
-        getAPIKey(for: provider) != nil
     }
 }

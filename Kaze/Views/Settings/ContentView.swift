@@ -56,32 +56,20 @@ private enum AppVersion {
 // MARK: - Root View
 
 struct ContentView: View {
-    @ObservedObject var appleSpeechModelManager: AppleSpeechModelManager
-    @ObservedObject var whisperModelManager: WhisperModelManager
-    @ObservedObject var parakeetModelManager: FluidAudioModelManager
     @ObservedObject var historyManager: TranscriptionHistoryManager
     @ObservedObject var customWordsManager: CustomWordsManager
-    @ObservedObject var updaterManager: UpdaterManager
     let restartOnboarding: () -> Void
 
     @State private var selectedTab: SettingsTab? = .general
 
     init(
-        appleSpeechModelManager: AppleSpeechModelManager,
-        whisperModelManager: WhisperModelManager,
-        parakeetModelManager: FluidAudioModelManager,
         historyManager: TranscriptionHistoryManager,
         customWordsManager: CustomWordsManager,
-        updaterManager: UpdaterManager,
         restartOnboarding: @escaping () -> Void,
         initialTab: SettingsTab = .general
     ) {
-        self.appleSpeechModelManager = appleSpeechModelManager
-        self.whisperModelManager = whisperModelManager
-        self.parakeetModelManager = parakeetModelManager
         self.historyManager = historyManager
         self.customWordsManager = customWordsManager
-        self.updaterManager = updaterManager
         self.restartOnboarding = restartOnboarding
         _selectedTab = State(initialValue: initialTab)
     }
@@ -117,15 +105,11 @@ struct ContentView: View {
     private func settingsDetail(for tab: SettingsTab) -> some View {
         switch tab {
         case .general:
-            GeneralSettingsView(
-                appleSpeechModelManager: appleSpeechModelManager,
-                whisperModelManager: whisperModelManager,
-                parakeetModelManager: parakeetModelManager
-            )
+            CloudflareSettingsView()
         case .controls:
             ControlsSettingsView()
         case .output:
-            OutputSettingsView()
+            CloudOutputSettingsView()
         case .vocabulary:
             VocabularySettingsView(customWordsManager: customWordsManager)
         case .stats:
@@ -135,7 +119,7 @@ struct ContentView: View {
         case .debug:
             DebugSettingsView(restartOnboarding: restartOnboarding)
         case .about:
-            AboutSettingsView(updaterManager: updaterManager)
+            AboutSettingsView()
         }
     }
 }
@@ -244,10 +228,142 @@ private struct SettingsWindowConfigurator: NSViewRepresentable {
 
 // MARK: - General Settings Tab
 
-private struct GeneralSettingsView: View {
-    @AppStorage(AppPreferenceKey.transcriptionEngine) private var engineRaw = TranscriptionEngine.dictation.rawValue
+private struct CloudflareSettingsView: View {
     @AppStorage(AppPreferenceKey.selectedMicrophoneID) private var selectedMicrophoneID = ""
+    @AppStorage(AppPreferenceKey.cloudflareAccountID) private var cloudflareAccountID = ""
+    @AppStorage(AppPreferenceKey.transcriptionLanguage) private var transcriptionLanguage = "en"
     @State private var availableMicrophones: [AudioInputDevice] = []
+    @State private var tokenInput = ""
+    @State private var tokenSaved = false
+    @State private var tokenSaveFailed = false
+    @StateObject private var audioDeviceObserver = AudioDeviceObserver()
+
+    private var microphoneSelection: Binding<String> {
+        Binding(
+            get: {
+                guard !selectedMicrophoneID.isEmpty else { return "" }
+                return availableMicrophones.contains { $0.uid == selectedMicrophoneID }
+                    ? selectedMicrophoneID : ""
+            },
+            set: { selectedMicrophoneID = $0 }
+        )
+    }
+
+    var body: some View {
+        Form {
+            Section("Transcription") {
+                LabeledContent("Model", value: "Whisper Large V3 Turbo")
+                Text("Audio is transcribed by Cloudflare-hosted Whisper Large V3 Turbo. No speech or language model runs on this Mac, and Kaze does not run another LLM over the transcript.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            Section("Microphone") {
+                Picker("Input device", selection: microphoneSelection) {
+                    Text("System Default").tag("")
+                    Divider()
+                    ForEach(availableMicrophones, id: \.uid) { microphone in
+                        Text(microphone.name).tag(microphone.uid)
+                    }
+                }
+            }
+
+            Section("Cloudflare Workers AI") {
+                TextField("Account ID", text: $cloudflareAccountID)
+                    .font(.system(size: 11, design: .monospaced))
+
+                HStack(spacing: 8) {
+                    SecureField(
+                        tokenSaved ? "Token saved in Keychain" : "Workers AI API token",
+                        text: $tokenInput
+                    )
+                    .font(.system(size: 11, design: .monospaced))
+
+                    Button("Save") { saveToken() }
+                        .disabled(tokenInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+
+                    if tokenSaved {
+                        Button("Remove", role: .destructive) {
+                            if KeychainManager.deleteCloudflareAPIToken() {
+                                tokenInput = ""
+                                tokenSaved = false
+                                tokenSaveFailed = false
+                            }
+                        }
+                    }
+                }
+
+                if tokenSaveFailed {
+                    Label("Kaze could not save the token to Keychain.", systemImage: "exclamationmark.triangle.fill")
+                        .font(.caption)
+                        .foregroundStyle(.red)
+                } else {
+                    Text(tokenSaved ? "Token stored securely in your Mac's Keychain." : "The token is never stored in app preferences.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
+                TextField("Language hint", text: $transcriptionLanguage, prompt: Text("en"))
+                    .frame(maxWidth: 160)
+                Text("Use an ISO-639-1 code such as en, hi, or fr, or leave this empty for automatic detection.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
+            }
+
+            Section("System") {
+                Toggle(isOn: Binding(
+                    get: { SMAppService.mainApp.status == .enabled },
+                    set: { enabled in
+                        do {
+                            if enabled { try SMAppService.mainApp.register() }
+                            else { try SMAppService.mainApp.unregister() }
+                        } catch {
+                            print("Launch at login toggle failed: \(error)")
+                        }
+                    }
+                )) {
+                    Text("Start Kaze when you log in")
+                }
+            }
+        }
+        .formStyle(.grouped)
+        .contentMargins(.top, 8, for: .scrollContent)
+        .onAppear {
+            tokenSaved = KeychainManager.hasCloudflareAPIToken()
+            refreshMicrophones()
+            audioDeviceObserver.onChange = refreshMicrophones
+            audioDeviceObserver.start()
+        }
+        .onDisappear { audioDeviceObserver.stop() }
+    }
+
+    private func saveToken() {
+        let token = tokenInput.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !token.isEmpty else { return }
+        tokenSaved = KeychainManager.saveCloudflareAPIToken(token)
+        tokenSaveFailed = !tokenSaved
+        if tokenSaved { tokenInput = "" }
+    }
+
+    private func refreshMicrophones() {
+        availableMicrophones = listAudioInputDevices()
+        if !selectedMicrophoneID.isEmpty && !isKnownAudioInputDevice(selectedMicrophoneID) {
+            selectedMicrophoneID = ""
+        }
+    }
+}
+
+#if false
+private struct GeneralSettingsView: View {
+    @AppStorage(AppPreferenceKey.transcriptionEngine) private var engineRaw = TranscriptionEngine.whisper.rawValue
+    @AppStorage(AppPreferenceKey.selectedMicrophoneID) private var selectedMicrophoneID = ""
+    @AppStorage(AppPreferenceKey.cloudflareAccountID) private var cloudflareAccountID = ""
+    @AppStorage(AppPreferenceKey.transcriptionLanguage) private var transcriptionLanguage = "en"
+    @State private var availableMicrophones: [AudioInputDevice] = []
+    @State private var cloudflareAPITokenInput = ""
+    @State private var cloudflareAPITokenSaved = false
+    @State private var cloudflareAPITokenSaveFailed = false
     @StateObject private var audioDeviceObserver = AudioDeviceObserver()
 
     @ObservedObject var appleSpeechModelManager: AppleSpeechModelManager
@@ -255,7 +371,7 @@ private struct GeneralSettingsView: View {
     @ObservedObject var parakeetModelManager: FluidAudioModelManager
 
     private var selectedEngine: TranscriptionEngine {
-        TranscriptionEngine(rawValue: engineRaw) ?? .dictation
+        TranscriptionEngine(rawValue: engineRaw) ?? .whisper
     }
 
     private var microphoneSelection: Binding<String> {
@@ -287,24 +403,6 @@ private struct GeneralSettingsView: View {
                     appleSpeechModelStatusRow
                 }
 
-                if selectedEngine == .whisper {
-                    Picker("Whisper model", selection: Binding(
-                        get: { whisperModelManager.selectedVariant },
-                        set: { whisperModelManager.selectedVariant = $0 }
-                    )) {
-                        ForEach(WhisperModelVariant.allCases) { variant in
-                            Text("\(variant.title) (\(variant.sizeDescription))").tag(variant)
-                        }
-                    }
-                    .disabled(isModelBusy)
-
-                    Text(whisperModelManager.selectedVariant.qualityDescription)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-
-                    whisperModelStatusRow
-                }
-
                 if selectedEngine == .parakeet {
                     fluidAudioModelStatusRow(manager: parakeetModelManager, model: .parakeet)
                 }
@@ -318,6 +416,72 @@ private struct GeneralSettingsView: View {
                         Text(mic.name).tag(mic.uid)
                     }
                 }
+            }
+
+            Section("Cloudflare Workers AI") {
+                TextField("Account ID", text: $cloudflareAccountID)
+                    .font(.system(size: 11, design: .monospaced))
+
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("API token")
+
+                    HStack(spacing: 8) {
+                        SecureField(
+                            cloudflareAPITokenSaved ? "Token saved in Keychain" : "Enter a Workers AI API token",
+                            text: $cloudflareAPITokenInput
+                        )
+                        .textFieldStyle(.roundedBorder)
+                        .font(.system(size: 11, design: .monospaced))
+                        .frame(minWidth: 260, maxWidth: .infinity)
+                        .onChange(of: cloudflareAPITokenInput) {
+                            cloudflareAPITokenSaveFailed = false
+                        }
+
+                        Button("Save") {
+                            saveCloudflareAPIToken()
+                        }
+                        .controlSize(.small)
+                        .disabled(cloudflareAPITokenInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+
+                        if cloudflareAPITokenSaved {
+                            Button("Remove", role: .destructive) {
+                                if KeychainManager.deleteCloudflareAPIToken() {
+                                    cloudflareAPITokenInput = ""
+                                    cloudflareAPITokenSaved = false
+                                    cloudflareAPITokenSaveFailed = false
+                                }
+                            }
+                            .controlSize(.small)
+                        }
+                    }
+
+                    if cloudflareAPITokenSaveFailed {
+                        Label("Kaze could not save the token to Keychain.", systemImage: "exclamationmark.triangle.fill")
+                            .font(.caption)
+                            .foregroundStyle(.red)
+                    } else {
+                        Text(cloudflareAPITokenSaved
+                            ? "Token stored securely in your Mac's Keychain."
+                            : "The token is stored in Keychain, never in app preferences.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+
+                TextField("Language hint", text: $transcriptionLanguage, prompt: Text("en"))
+                    .frame(maxWidth: 160)
+
+                Text("Use an ISO-639-1 language code such as en, hi, or fr. This is a hint to the transcription model.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
+                Label {
+                    Text("Dictated audio is sent to Cloudflare-hosted Whisper Large V3 Turbo. Transcription is not performed on this Mac or sent to OpenAI; your company's Cloudflare policies still apply.")
+                } icon: {
+                    Image(systemName: "lock.shield")
+                }
+                .font(.caption)
+                .foregroundStyle(.secondary)
             }
 
             Section("System") {
@@ -351,11 +515,25 @@ private struct GeneralSettingsView: View {
             audioDeviceObserver.stop()
         }
         .onAppear {
+            cloudflareAPITokenSaved = KeychainManager.hasCloudflareAPIToken()
             refreshAvailableMicrophones()
             audioDeviceObserver.onChange = {
                 refreshAvailableMicrophones()
             }
             audioDeviceObserver.start()
+        }
+    }
+
+    private func saveCloudflareAPIToken() {
+        let token = cloudflareAPITokenInput.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !token.isEmpty else { return }
+
+        if KeychainManager.saveCloudflareAPIToken(token) {
+            cloudflareAPITokenInput = ""
+            cloudflareAPITokenSaved = true
+            cloudflareAPITokenSaveFailed = false
+        } else {
+            cloudflareAPITokenSaveFailed = true
         }
     }
 
@@ -643,6 +821,8 @@ private struct GeneralSettingsView: View {
 
 }
 
+#endif
+
 // MARK: - Controls Settings Tab
 
 private struct ControlsSettingsView: View {
@@ -727,8 +907,30 @@ private struct ControlsSettingsView: View {
     }
 }
 
+private struct CloudOutputSettingsView: View {
+    @AppStorage(AppPreferenceKey.appendTrailingSpace) private var appendTrailingSpace = false
+    @AppStorage(AppPreferenceKey.removeFillerWords) private var removeFillerWords = false
+
+    var body: some View {
+        Form {
+            Section("Cleanup") {
+                Toggle("Append a space after each transcription", isOn: $appendTrailingSpace)
+                Toggle("Remove filler words", isOn: $removeFillerWords)
+            }
+            Section("Transcription output") {
+                Text("Whisper Large V3 Turbo provides the final text directly. This build does not run an additional local or cloud LLM over it.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .formStyle(.grouped)
+        .contentMargins(.top, 8, for: .scrollContent)
+    }
+}
+
+#if false
 private struct OutputSettingsView: View {
-    @AppStorage(AppPreferenceKey.transcriptionEngine) private var engineRaw = TranscriptionEngine.dictation.rawValue
+    @AppStorage(AppPreferenceKey.transcriptionEngine) private var engineRaw = TranscriptionEngine.whisper.rawValue
     @AppStorage(AppPreferenceKey.appendTrailingSpace) private var appendTrailingSpace = false
     @AppStorage(AppPreferenceKey.removeFillerWords) private var removeFillerWords = false
     @AppStorage(AppPreferenceKey.smartFormattingEnabled) private var smartFormattingEnabled = false
@@ -741,7 +943,7 @@ private struct OutputSettingsView: View {
     @State private var apiKeySaved = false
 
     private var selectedEngine: TranscriptionEngine {
-        TranscriptionEngine(rawValue: engineRaw) ?? .dictation
+        TranscriptionEngine(rawValue: engineRaw) ?? .whisper
     }
 
     private var selectedEnhancementMode: EnhancementMode {
@@ -802,7 +1004,14 @@ private struct OutputSettingsView: View {
                 .toggleStyle(.switch)
             }
 
-            Section("Smart Formatting") {
+            Section("Transcription output") {
+                Text("Whisper Large V3 Turbo provides the final text directly. This build does not run an additional local or cloud LLM over the transcript.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            if false { // Retained only to ease rebasing from upstream; intentionally unavailable.
+              Section("Smart Formatting") {
                 Toggle(isOn: $smartFormattingEnabled) {
                     VStack(alignment: .leading, spacing: 4) {
                         HStack(spacing: 6) {
@@ -845,7 +1054,7 @@ private struct OutputSettingsView: View {
                 }
             }
 
-            Section("Text Enhancement") {
+              Section("Text Enhancement") {
                 Picker("Mode", selection: $enhancementModeRaw) {
                     Text(EnhancementMode.off.title).tag(EnhancementMode.off.rawValue)
                     Text(EnhancementMode.appleIntelligence.title)
@@ -963,6 +1172,7 @@ private struct OutputSettingsView: View {
                         }
                     }
                 }
+              }
             }
         }
         .formStyle(.grouped)
@@ -978,6 +1188,8 @@ private struct OutputSettingsView: View {
             && (FormattingBackend(rawValue: formattingBackendRaw) ?? .appleIntelligence) == .cloudAI
     }
 }
+
+#endif
 
 private struct StatsSettingsView: View {
     @ObservedObject var historyManager: TranscriptionHistoryManager
@@ -1498,7 +1710,7 @@ private struct VocabularySettingsView: View {
                     Text("No custom words yet")
                         .font(.body)
                         .foregroundStyle(.secondary)
-                    Text("Add names, abbreviations, and specialised terms.\nWhisper uses them during transcription; AI enhancement preserves their spelling.")
+                    Text("Add names, abbreviations, and specialised terms.\nWhisper receives them as initial vocabulary context.")
                         .font(.caption)
                         .foregroundStyle(.tertiary)
                         .multilineTextAlignment(.center)
@@ -1632,9 +1844,6 @@ class AudioDeviceObserver: ObservableObject {
 // MARK: - About Settings
 
 private struct AboutSettingsView: View {
-    @ObservedObject var updaterManager: UpdaterManager
-    @State private var avatarImage: NSImage?
-
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 24) {
@@ -1657,50 +1866,8 @@ private struct AboutSettingsView: View {
 
                 Divider()
 
-                VStack(alignment: .leading, spacing: 12) {
-                    Text("Updates")
-                        .font(.headline)
-
-                    Toggle(isOn: Binding(
-                        get: { updaterManager.automaticallyChecksForUpdates },
-                        set: { updaterManager.automaticallyChecksForUpdates = $0 }
-                    )) {
-                        Text("Automatically check for updates")
-                    }
-                    .toggleStyle(.switch)
-
-                    Button("Check for Updates…") {
-                        updaterManager.checkForUpdates()
-                    }
-                    .disabled(!updaterManager.canCheckForUpdates)
-                }
-
-                Divider()
-
-                VStack(alignment: .leading, spacing: 12) {
-                    Text("Follow")
-                        .font(.headline)
-
-                    Text("Follow Fayaz on Twitter for Kaze updates, release notes, and development notes.")
-                        .foregroundStyle(.secondary)
-
-                    Link(destination: URL(string: "https://x.com/fayazara")!) {
-                        HStack(spacing: 8) {
-                            if let avatarImage {
-                                Image(nsImage: avatarImage)
-                                    .resizable()
-                                    .aspectRatio(contentMode: .fill)
-                                    .frame(width: 24, height: 24)
-                                    .clipShape(Circle())
-                            }
-
-                            Text("Follow Fayaz on Twitter")
-                            Image(systemName: "arrow.up.right")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                        }
-                    }
-                }
+                Text("This private Cloudflare Whisper build does not install updates from the upstream Kaze project.")
+                    .foregroundStyle(.secondary)
 
                 Divider()
 
@@ -1724,9 +1891,6 @@ private struct AboutSettingsView: View {
             .frame(maxWidth: 520, alignment: .leading)
         }
         .contentMargins(.top, 8, for: .scrollContent)
-        .task {
-            await loadAvatar()
-        }
     }
 
     @ViewBuilder
@@ -1743,17 +1907,6 @@ private struct AboutSettingsView: View {
         }
     }
 
-    private func loadAvatar() async {
-        guard let url = URL(string: "https://github.com/fayazara.png") else { return }
-        do {
-            let (data, _) = try await URLSession.shared.data(from: url)
-            if let image = NSImage(data: data) {
-                await MainActor.run { avatarImage = image }
-            }
-        } catch {
-            // The about page works fine without the remote avatar.
-        }
-    }
 }
 
 private extension Int {

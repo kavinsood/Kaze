@@ -23,7 +23,7 @@ struct TranscriptionRecord: Codable, Identifiable {
     let id: UUID
     let text: String
     let timestamp: Date
-    let engine: String       // "dictation" or "whisper"
+    let engine: String       // "whisper" identifies Cloudflare-hosted Whisper in this fork.
     let wasEnhanced: Bool
     let wordCount: Int
     let speechDuration: TimeInterval
@@ -66,7 +66,7 @@ struct TranscriptionRecord: Codable, Identifiable {
         id = try container.decodeIfPresent(UUID.self, forKey: .id) ?? UUID()
         text = try container.decode(String.self, forKey: .text)
         timestamp = try container.decodeIfPresent(Date.self, forKey: .timestamp) ?? Date()
-        engine = try container.decodeIfPresent(String.self, forKey: .engine) ?? TranscriptionEngine.dictation.rawValue
+        engine = try container.decodeIfPresent(String.self, forKey: .engine) ?? TranscriptionEngine.whisper.rawValue
         wasEnhanced = try container.decodeIfPresent(Bool.self, forKey: .wasEnhanced) ?? false
         wordCount = try container.decodeIfPresent(Int.self, forKey: .wordCount) ?? text.kazeWordCount
         speechDuration = try container.decodeIfPresent(TimeInterval.self, forKey: .speechDuration) ?? 0

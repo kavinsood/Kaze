@@ -16,7 +16,7 @@
             <BuildableReference
                BuildableIdentifier = "primary"
                BlueprintIdentifier = "31F19CCC2F4D76D200E96913"
-               BuildableName = "Kaze.app"
+               BuildableName = "Kaze Dev.app"
                BlueprintName = "Kaze"
                ReferencedContainer = "container:Kaze.xcodeproj">
             </BuildableReference>
@@ -58,7 +58,7 @@
          <BuildableReference
             BuildableIdentifier = "primary"
             BlueprintIdentifier = "31F19CCC2F4D76D200E96913"
-            BuildableName = "Kaze.app"
+               BuildableName = "Kaze Dev.app"
             BlueprintName = "Kaze"
             ReferencedContainer = "container:Kaze.xcodeproj">
          </BuildableReference>
@@ -75,7 +75,7 @@
          <BuildableReference
             BuildableIdentifier = "primary"
             BlueprintIdentifier = "31F19CCC2F4D76D200E96913"
-            BuildableName = "Kaze.app"
+               BuildableName = "Kaze Dev.app"
             BlueprintName = "Kaze"
             ReferencedContainer = "container:Kaze.xcodeproj">
          </BuildableReference>

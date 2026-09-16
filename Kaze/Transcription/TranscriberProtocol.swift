@@ -7,7 +7,7 @@ struct AudioInputDevice: Equatable {
     let name: String
 }
 
-/// Protocol that all transcription engines conform to.
+/// Shared observable surface for the Cloudflare transcriber and recording overlay.
 @MainActor
 protocol TranscriberProtocol: ObservableObject {
     var isRecording: Bool { get }

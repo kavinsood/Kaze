@@ -30,20 +30,8 @@ class OverlayState: ObservableObject {
         isEnhancing.sink { [weak self] in self?.isEnhancing = $0 }.store(in: &cancellables)
     }
 
-    /// Convenience: bind to a SpeechTranscriber.
-    func bind(to transcriber: SpeechTranscriber) {
-        bind(isRecording: transcriber.$isRecording, audioLevel: transcriber.$audioLevel,
-             transcribedText: transcriber.$transcribedText, isEnhancing: transcriber.$isEnhancing)
-    }
-
-    /// Convenience: bind to a WhisperTranscriber.
-    func bind(to transcriber: WhisperTranscriber) {
-        bind(isRecording: transcriber.$isRecording, audioLevel: transcriber.$audioLevel,
-             transcribedText: transcriber.$transcribedText, isEnhancing: transcriber.$isEnhancing)
-    }
-
-    /// Convenience: bind to a FluidAudioTranscriber.
-    func bind(to transcriber: FluidAudioTranscriber) {
+    /// Bind to Cloudflare-hosted Whisper Large V3 Turbo.
+    func bind(to transcriber: CloudflareTranscriber) {
         bind(isRecording: transcriber.$isRecording, audioLevel: transcriber.$audioLevel,
              transcribedText: transcriber.$transcribedText, isEnhancing: transcriber.$isEnhancing)
     }
