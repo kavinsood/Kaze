@@ -117,7 +117,12 @@ class HotkeyManager {
         guard let tap = CGEvent.tapCreate(
             tap: .cgSessionEventTap,
             place: .headInsertEventTap,
-            options: .listenOnly,
+            // A pass-through active tap is authorized by Accessibility. A
+            // listen-only tap is governed by the separate Input Monitoring
+            // permission on recent macOS releases, which makes local rebuilds
+            // appear healthy while silently receiving no keyboard events.
+            // The callback always returns the original event unchanged.
+            options: .defaultTap,
             eventsOfInterest: eventMask,
             callback: { proxy, type, event, refcon -> Unmanaged<CGEvent>? in
                 guard let refcon else { return Unmanaged.passUnretained(event) }
