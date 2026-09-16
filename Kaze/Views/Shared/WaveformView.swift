@@ -8,6 +8,7 @@ struct WaveformView: View {
     var processingStatusText: String = ""
     var notchMode: Bool = false
     var notchVisible: Bool = false
+    var notchMetrics: NotchMetrics?
 
     // Number of bars in the waveform
     private let barCount = 16
@@ -27,9 +28,12 @@ struct WaveformView: View {
     private var cornerRadius: CGFloat { isCompact ? 24 : 20 }
     private var textOverflows: Bool { transcribedText.count > 38 }
 
-    // Notch mode corner radii are fixed so width never shifts.
-    private let notchTopCornerRadius: CGFloat = 8
-    private let notchBottomCornerRadius: CGFloat = 10
+    // Atoll's closed-notch geometry blends much more naturally into the camera
+    // housing than a pill-like radius. Expanded content gets a slightly softer
+    // bottom edge without changing the top-center anchor.
+    private var notchTopCornerRadius: CGFloat { isCompact ? 6 : 10 }
+    private var notchBottomCornerRadius: CGFloat { isCompact ? 14 : 20 }
+    private var notchBlack: Color { Color(.sRGB, white: 0, opacity: 1) }
 
     var body: some View {
         Group {
@@ -100,9 +104,9 @@ struct WaveformView: View {
 
     private var notchBody: some View {
         VStack(spacing: 0) {
-            // Main row: ione on left, spacer, waveform/timer on right
+            // The center is exactly the size AppKit reports for the hardware
+            // notch. Controls live only in the two unobscured side wings.
             HStack(spacing: 0) {
-                // Left side: icon
                 Group {
                     if isEnhancing {
                         processingSpinner
@@ -110,68 +114,116 @@ struct WaveformView: View {
                         kazeIcon
                     }
                 }
-                .padding(.leading, 20)
+                .frame(width: visibleLeadingWingWidth, height: physicalNotchHeight)
+                .opacity(notchVisible ? 1 : 0)
+                .scaleEffect(notchVisible ? 1 : 0.82, anchor: .trailing)
 
-                Spacer(minLength: 12)
+                Color.clear
+                    .frame(width: physicalNotchWidth, height: physicalNotchHeight)
 
-                // Right side: waveform bars
                 Group {
                     if isEnhancing {
-                        processingBars
+                        notchProcessingBars
                             .transition(.opacity)
                     } else {
                         notchWaveformBars
                             .transition(.opacity)
                     }
                 }
-                .padding(.trailing, 20)
+                .frame(width: visibleTrailingWingWidth, height: physicalNotchHeight)
+                .opacity(notchVisible ? 1 : 0)
+                .scaleEffect(notchVisible ? 1 : 0.82, anchor: .leading)
             }
-            .animation(.easeInOut(duration: 0.25), value: isEnhancing)
-            .frame(height: 32)
+            .animation(.smooth(duration: 0.22), value: isEnhancing)
+            .frame(height: physicalNotchHeight)
 
-            // Live text below the notch bar (only Direct Dictation provides this)
+            // Transcript text appears here when a provider publishes interim or final text.
             if hasText {
-                transcriptionTextRow(maxWidth: notchContentWidth - 56)
-                    .padding(.horizontal, 4)
+                transcriptionTextRow(maxWidth: expandedNotchWidth - 40)
+                    .padding(.horizontal, 20)
                     .padding(.top, 6)
                     .padding(.bottom, 12)
             } else if hasProcessingStatus {
-                processingStatusRow(maxWidth: notchContentWidth - 56)
-                    .padding(.horizontal, 4)
+                processingStatusRow(maxWidth: expandedNotchWidth - 40)
+                    .padding(.horizontal, 20)
                     .padding(.top, 6)
                     .padding(.bottom, 12)
             }
         }
-        .frame(width: notchContentWidth)
+        .frame(width: currentNotchWidth)
         .background(
             NotchShape(topCornerRadius: notchTopCornerRadius, bottomCornerRadius: notchBottomCornerRadius)
-                .fill(.black)
+                .fill(notchBlack)
         )
         .clipShape(
             NotchShape(topCornerRadius: notchTopCornerRadius, bottomCornerRadius: notchBottomCornerRadius)
         )
-        .animation(.spring(response: 0.35, dampingFraction: 0.75), value: notchVisible)
-        .animation(.spring(response: 0.4, dampingFraction: 0.7), value: isCompact)
-        .animation(.spring(response: 0.4, dampingFraction: 0.7), value: hasText)
+        // Mirror Atoll's off-screen top bleed so antialiasing never exposes a
+        // hairline between this surface and the physical notch.
+        .padding(.top, notchTopScreenBleed)
+        .overlay(alignment: .top) {
+            Rectangle()
+                .fill(notchBlack)
+                .frame(height: notchTopScreenBleed)
+        }
+        .compositingGroup()
+        .shadow(
+            color: (hasText || hasProcessingStatus) ? .black.opacity(0.55) : .clear,
+            radius: 8,
+            y: 2
+        )
+        .animation(.spring(response: 0.42, dampingFraction: 1), value: notchVisible)
+        .animation(.spring(response: 0.42, dampingFraction: 1), value: isCompact)
+        .animation(.spring(response: 0.42, dampingFraction: 1), value: hasText)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
     }
 
-    /// Width of the notch content.
-    /// Fixed width; only height changes when text appears.
-    private var notchContentWidth: CGFloat {
-        notchVisible ? 280 : 0
+    private var physicalNotchWidth: CGFloat { notchMetrics?.physicalWidth ?? 220 }
+    private var physicalNotchHeight: CGFloat { notchMetrics?.physicalHeight ?? 38 }
+    private var notchTopScreenBleed: CGFloat { notchMetrics?.topScreenBleed ?? 4 }
+    private var visibleLeadingWingWidth: CGFloat {
+        notchVisible ? (notchMetrics?.leadingWingWidth ?? 64) : 0
+    }
+    private var visibleTrailingWingWidth: CGFloat {
+        notchVisible ? (notchMetrics?.trailingWingWidth ?? 64) : 0
+    }
+    private var expandedNotchWidth: CGFloat {
+        notchMetrics?.expandedWidth ?? 348
+    }
+    private var currentNotchWidth: CGFloat {
+        physicalNotchWidth + visibleLeadingWingWidth + visibleTrailingWingWidth
     }
 
     // MARK: - Shared components
 
     private var kazeIcon: some View {
-        Image("kaze-icon")
-            .renderingMode(.template)
-            .resizable()
-            .aspectRatio(contentMode: .fit)
-            .frame(width: 16, height: 16)
-            .foregroundStyle(.white.opacity(0.9))
-            .transition(.opacity)
+        Group {
+            if notchMode {
+                // A system glyph is crisp at this tiny size and remains reliable
+                // in the lightweight local build, which does not compile an asset
+                // catalog. The previous named image silently rendered only its dot.
+                Image(systemName: "mic.fill")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(.white.opacity(0.78))
+            } else {
+                Image("kaze-icon")
+                    .renderingMode(.template)
+                    .resizable()
+                    .aspectRatio(contentMode: .fit)
+                    .frame(width: 14, height: 14)
+                    .foregroundStyle(.white.opacity(0.76))
+            }
+        }
+            .overlay(alignment: .bottomTrailing) {
+                if notchMode && isRecording && !isEnhancing {
+                    Circle()
+                        .fill(Color.red.opacity(0.88))
+                        .frame(width: 4, height: 4)
+                        .overlay(Circle().stroke(notchBlack, lineWidth: 1))
+                        .offset(x: 2, y: 2)
+                }
+            }
+            .transition(.opacity.combined(with: .scale(scale: 0.92)))
     }
 
     private func transcriptionTextRow(maxWidth: CGFloat) -> some View {
@@ -243,9 +295,21 @@ struct WaveformView: View {
         HStack(alignment: .center, spacing: 2.5) {
             ForEach(0..<notchBarCount, id: \.self) { index in
                 RoundedRectangle(cornerRadius: 1.5)
-                    .fill(Color.red)
-                    .frame(width: 3, height: notchBarHeight(for: index))
-                    .animation(.easeInOut(duration: 0.1), value: audioLevel)
+                    .fill(Color.red.opacity(0.82))
+                    .frame(width: 2.5, height: notchBarHeight(for: index))
+                    .animation(.smooth(duration: 0.12), value: audioLevel)
+            }
+        }
+        .frame(height: 20)
+    }
+
+    private var notchProcessingBars: some View {
+        HStack(alignment: .center, spacing: 2.5) {
+            ForEach(0..<notchBarCount, id: \.self) { index in
+                let phaseIndex = min(index * 3, barCount - 1)
+                RoundedRectangle(cornerRadius: 1.5)
+                    .fill(.white.opacity(processingBarOpacity(for: phaseIndex)))
+                    .frame(width: 3, height: processingBarHeight(for: phaseIndex))
             }
         }
         .frame(height: 20)
@@ -258,7 +322,7 @@ struct WaveformView: View {
         let phase = phases[min(phaseIndex, barCount - 1)]
         let sine = (sin(phase) + 1) / 2
         let minH: CGFloat = 4
-        let maxH: CGFloat = 18
+        let maxH: CGFloat = 16
 
         if isRecording {
             let driven = minH + (maxH - minH) * level * CGFloat(sine * 0.5 + 0.5)
@@ -417,15 +481,4 @@ struct NotchShape: Shape {
 
         return path
     }
-}
-
-#Preview {
-    VStack(spacing: 20) {
-        WaveformView(audioLevel: 0.6, isRecording: true, transcribedText: "Hello world this is a long test")
-        WaveformView(audioLevel: 0, isRecording: false, transcribedText: "", isEnhancing: true, processingStatusText: "Warming up model...")
-        WaveformView(audioLevel: 0.6, isRecording: true, transcribedText: "Hello world this is a long test", notchMode: true)
-        WaveformView(audioLevel: 0, isRecording: false, transcribedText: "", isEnhancing: true, processingStatusText: "Warming up model...", notchMode: true)
-    }
-    .padding()
-    .background(Color.gray.opacity(0.3))
 }
