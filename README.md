@@ -1,117 +1,52 @@
-# Kaze
+# Kaze Cloud
 
-Hold a global hotkey, speak, and the transcribed text is automatically pasted into whatever app you're using. Everything runs locally on your Mac -- no cloud, no API keys, no data leaves your machine.
-
-https://github.com/user-attachments/assets/8fde004a-e07a-45fc-ae3c-8f8a216873d3
-
-## Download
-
-Grab the latest `.dmg` from [GitHub Releases](https://github.com/fayazara/Kaze/releases/latest).
+Hold a global hotkey, speak, and paste the transcription into the active macOS app. This fork uses only Cloudflare-hosted `@cf/openai/whisper-large-v3-turbo`. Speech recognition does not run locally.
 
 ## How it works
 
-1. **Press your global hotkey** (default: `Option + Command`) to start recording.
-2. **Speak** while Kaze captures audio and shows a floating waveform overlay.
-3. **Stop recording** (release in Hold mode, or press again in Toggle mode).
-4. **Kaze pastes the transcription** into the focused app while preserving your clipboard.
+1. Press the global hotkey to begin recording.
+2. Kaze captures microphone audio and displays a waveform.
+3. Release the hotkey (or press it again in toggle mode).
+4. Kaze converts the recording to 16 kHz mono PCM WAV and sends it to Whisper Large V3 Turbo on Workers AI.
+5. The returned text is pasted into the focused app.
 
-The app lives entirely in the menu bar with no Dock icon. On first launch, a guided onboarding wizard walks you through hotkey setup and engine selection.
+Recordings are limited to five minutes. The model runs on Cloudflare's infrastructure and is currently priced by Cloudflare at $0.00051 per audio minute.
 
-## Features
+## Cloudflare setup
 
-### Transcription engines
+You need:
 
-> **Personal recommendation** -- use **Parakeet v3 (NVIDIA)** for the best overall results.
+- A Cloudflare account with Workers AI access.
+- Your 32-character Cloudflare Account ID.
+- A token created with Cloudflare's **Create a Workers AI API Token** template. A custom token needs **Workers AI → Read** on the selected account.
 
-Kaze ships with **3 fully on-device transcription engines**:
+Enter these values during onboarding or under **Settings → General → Cloudflare Workers AI**. The Account ID is stored in app preferences. The API token is stored in macOS Keychain.
 
-| Engine | Framework | Notes |
-|---|---|---|
-| **Direct Dictation** | Apple `SpeechAnalyzer` + `SpeechTranscriber` | Real-time streaming, uses device locale and a system-managed model |
-| **Whisper (OpenAI)** | [WhisperKit](https://github.com/argmaxinc/WhisperKit) | Local model variants: Tiny, Base, Small, Large v3 Turbo |
-| **Parakeet v3 (NVIDIA)** | [FluidAudio](https://github.com/FluidInference/FluidAudio) | Fast, high-accuracy English ASR (~600 MB CoreML model) |
+## Privacy
 
-### Model management
+Audio is sent directly to Cloudflare's native Workers AI endpoint for transcription by the Cloudflare-hosted model. It is not sent through an OpenAI provider account, and the app does not run an additional LLM over the transcript.
 
-- **One-click download/remove** in Settings -- view readiness status and model size on disk
-- **Cancel in-progress downloads** at any time
-- **Idle model unloading** -- models automatically free memory after 90 seconds of inactivity
-- **Graceful fallback** -- if a selected model is unavailable and Direct Dictation is ready, Kaze falls back to it
-
-### Recording overlay
-
-- **Dynamic Island / notch mode** -- a recording indicator that extends from the MacBook notch at the top of the screen, with animated expand/collapse transitions
-- **Pill mode** -- traditional floating pill at the bottom-center of the screen
-- **Real-time waveform bars** driven by audio level
-- **Live scrolling transcription** text with leading fade mask
-- **Processing state** -- shimmer animation + spinner while model inference or text enhancement runs
-
-### Apple Intelligence enhancement
-
-- Post-process transcriptions with on-device Foundation Models to fix grammar, punctuation, and formatting (macOS 26.0+)
-- **Customizable system prompt** -- edit the enhancement instructions or reset to defaults
-- Custom vocabulary words are injected into the enhancement prompt for better accuracy
-- Only applies to Direct Dictation (AI model engines already produce clean output)
-
-### Global hotkey
-
-- **Configurable shortcut** with support for key + modifier and modifier-only combos
-- **Two modes**: Hold to Talk and Press to Toggle
-- Default: `Option + Command`
-- Visual shortcut recorder in both Settings and Onboarding
-
-### Microphone selection
-
-- Pick a specific audio input device or use the system default
-- Real-time device list updates when hardware is connected/disconnected
-- Selection persists across sessions and is validated on launch
-
-### Onboarding
-
-- **6-step guided setup** on first launch: Welcome, permissions, hotkey configuration, engine selection, model download, and completion summary
-- Preferences are saved automatically as you complete each step
-
-### Other features
-
-- **Custom vocabulary/keywords** -- improve Whisper recognition and preserve exact spelling during AI enhancement
-- **Transcription history** -- persistent local history (latest 50 entries) with engine labels, "Enhanced" badge, relative timestamps, and one-click copy
-- **Clipboard-safe auto-paste** -- saves and restores your clipboard contents around each paste
-- **Trailing space option** -- optionally append a space after each transcription
-- **Launch at login** -- start Kaze automatically when you log in
-- **About dialog** -- version info, links to GitHub and Releases
-- **Menu bar status indicator** -- icon dims when no model is loaded, animates during model loading
-
-## Tech stack
-
-| Layer | Technology |
-|---|---|
-| UI | **SwiftUI** + **AppKit** -- SwiftUI for Settings/Onboarding/Overlay views; AppKit for menu bar, floating panel, clipboard, and simulated key events |
-| Speech | **Apple Speech framework** (`SpeechAnalyzer` + `SpeechTranscriber`) for on-device real-time dictation |
-| Whisper | [**WhisperKit**](https://github.com/argmaxinc/WhisperKit) for local OpenAI Whisper transcription |
-| Parakeet | [**FluidAudio**](https://github.com/FluidInference/FluidAudio) for Parakeet v3 CoreML runtime |
-| Enhancement | **Foundation Models** (Apple Intelligence on-device LLM) for text cleanup |
-| Hotkey | **CGEvent** tap for low-level global hotkey detection |
-| Audio | **AVCaptureSession** + **Accelerate/vDSP** for microphone capture, format conversion, and resampling |
-| State | **Combine** for reactive state bridging between transcription engines and the UI |
-| Login item | **SMAppService** for launch-at-login registration |
+Your employer must still approve Cloudflare as a processor. The app keeps transcription history locally unless you clear it in Settings.
 
 ## Requirements
 
-- macOS 26.0+
-- Xcode 26+ (for building from source)
-- Accessibility permission (for global hotkey)
-- Microphone permission
+- macOS 26+
+- Xcode 26+
+- Microphone and Accessibility permissions
+- Network access to `api.cloudflare.com`
 
-## Building from source
+## Build
 
-```bash
-git clone https://github.com/fayazara/Kaze.git
-cd Kaze
-open Kaze.xcodeproj
-```
+Open `Kaze.xcodeproj` in Xcode, select your Apple development team under Signing & Capabilities, and run the **Kaze Dev** scheme.
 
-Build and run in Xcode. Dependencies ([WhisperKit](https://github.com/argmaxinc/WhisperKit) + [FluidAudio](https://github.com/FluidInference/FluidAudio)) are resolved automatically via Swift Package Manager.
+For a personal build on a Mac that already has Apple's Command Line Tools, run `bash scripts/build-local-app.sh`. This creates an ad-hoc-signed `build/local/Kaze Cloud.app` without Xcode or Homebrew dependencies. Ad-hoc signing is suitable for running locally; internal distribution should use your organization's Developer ID or MDM signing workflow.
 
-## License
+The bundle identifiers for this fork are `com.kavin.KazeCloud` and `com.kavin.KazeCloud.dev`. Change them before distributing the app if those identifiers do not belong to your organization.
 
-MIT
+## Upstream and license
+
+This project is based on [fayazara/Kaze](https://github.com/fayazara/Kaze). Upstream automatic updates are disabled so this fork cannot replace itself with the local-model build.
+
+The physical-notch recording HUD draws design inspiration from [Atoll](https://github.com/Ebullioscopic/Atoll).
+
+Kaze is licensed under the MIT License. See [LICENSE](LICENSE).
