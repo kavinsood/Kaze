@@ -95,6 +95,7 @@ class RecordingOverlayWindow: NSPanel {
     private weak var notchScreen: NSScreen?
     private var notchMetrics: NotchMetrics?
     private(set) var isNotchMode = false
+    private var presentationGeneration = 0
 
     init() {
         super.init(
@@ -125,6 +126,8 @@ class RecordingOverlayWindow: NSPanel {
     }
 
     func show(state: OverlayState, notchMode: Bool = false) {
+        presentationGeneration += 1
+        let generation = presentationGeneration
         let screen = NSScreen.main
         let measuredMetrics = screen.flatMap(NotchMetrics.read(from:))
         let effectiveNotchMode = notchMode && measuredMetrics != nil
@@ -187,13 +190,16 @@ class RecordingOverlayWindow: NSPanel {
 
         // Trigger the expand animation on next runloop tick so SwiftUI picks it up
         if effectiveNotchMode {
-            DispatchQueue.main.async {
+            DispatchQueue.main.async { [weak self] in
+                guard self?.presentationGeneration == generation else { return }
                 state.isVisible = true
             }
         }
     }
 
     func hide(state: OverlayState? = nil, completion: (() -> Void)? = nil) {
+        presentationGeneration += 1
+        let generation = presentationGeneration
         if isNotchMode, let state {
             // Step 1: Clear text and collapse to compact shape
             state.transcribedText = ""
@@ -202,12 +208,14 @@ class RecordingOverlayWindow: NSPanel {
             state.isRecording = false
 
             // Step 2: After compact transition settles, shrink width to zero
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
+                guard self?.presentationGeneration == generation else { return }
                 state.isVisible = false
             }
 
             // Step 3: Remove window after shrink animation completes
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.65) { [weak self] in
+                guard self?.presentationGeneration == generation else { return }
                 self?.orderOut(nil)
                 completion?()
             }
@@ -216,6 +224,7 @@ class RecordingOverlayWindow: NSPanel {
                 ctx.duration = 0.3
                 animator().alphaValue = 0
             }, completionHandler: { [weak self] in
+                guard self?.presentationGeneration == generation else { return }
                 self?.orderOut(nil)
                 completion?()
             })
