@@ -5,12 +5,12 @@ Hold a global hotkey, speak, and paste the transcription into the active macOS a
 ## How it works
 
 1. Press the global hotkey to begin recording.
-2. Kaze captures microphone audio and displays a waveform.
+2. Kaze writes mono PCM audio to a private, locally synchronized recording journal as it arrives and displays a waveform.
 3. Release the hotkey (or press it again in toggle mode).
-4. Kaze converts the recording to 16 kHz mono PCM WAV and sends it to Whisper Large V3 Turbo on Workers AI.
-5. The returned text is pasted into the focused app.
+4. Kaze sends independent 30-second WAV chunks to Whisper Large V3 Turbo on Workers AI. Each successful chunk and its transcript are checkpointed to disk before the next request.
+5. The complete transcript is saved before Kaze posts ⌘V to the focused app. The app cannot prove that another app accepted the paste; delivery stays unconfirmed until you mark it delivered.
 
-Recordings are limited to five minutes. The model runs on Cloudflare's infrastructure and is currently priced by Cloudflare at $0.00051 per audio minute.
+There is no five-minute recording cutoff. If a network request fails temporarily, Kaze retries with backoff, including after relaunch; other failures remain available for manual retry. The model runs on Cloudflare's infrastructure. Long recordings use disk space (about 5.5 MB per minute at 48 kHz); free space and the recording format are practical limits. Standard WAV export is limited to files below 4 GB, although the original journal can be larger.
 
 ## Cloudflare setup
 
@@ -26,7 +26,9 @@ Enter these values during onboarding or under **Settings → General → Cloudfl
 
 Audio is sent directly to Cloudflare's native Workers AI endpoint for transcription by the Cloudflare-hosted model. It is not sent through an OpenAI provider account, and the app does not run an additional LLM over the transcript.
 
-Your employer must still approve Cloudflare as a processor. The app keeps transcription history locally unless you clear it in Settings.
+Your employer must still approve Cloudflare as a processor. Kaze stores audio and transcripts in its sandboxed Application Support `com.kavin.KazeCloud/Recordings` directory until you explicitly delete each recording under **Settings → Recordings**. Marking a recording delivered does not delete its audio. The separate, most-recent-50 text History can be cleared independently and is not a backup for the recording journal. Recordings are not encrypted beyond normal macOS account/FileVault protection. You can export WAV, retry failed jobs, and copy saved or partial transcripts from the Recordings tab.
+
+Capture-format errors, microphone interruptions, and detected timestamp gaps stop recording and flag the saved portion for manual review. A sudden hardware failure, lack of free disk space, or a microphone that never delivers audio cannot be repaired by software. The app does not use background URLSession transfers: a persisted local journal and saved per-chunk progress allow work to resume after launch even when an in-flight request is interrupted.
 
 ## Requirements
 
@@ -40,6 +42,13 @@ Your employer must still approve Cloudflare as a processor. The app keeps transc
 Open `Kaze.xcodeproj` in Xcode, select your Apple development team under Signing & Capabilities, and run the **Kaze Dev** scheme.
 
 For a personal build on a Mac that already has Apple's Command Line Tools, run `bash scripts/build-local-app.sh`. This creates an ad-hoc-signed `build/local/Kaze Cloud.app` without Xcode or Homebrew dependencies. Ad-hoc signing is suitable for running locally; internal distribution should use your organization's Developer ID or MDM signing workflow.
+
+Offline recovery test (synthetic audio, mocked HTTP, no microphone or Keychain):
+
+```sh
+swiftc -swift-version 5 -warnings-as-errors -default-isolation MainActor -target arm64-apple-macos26.0 Kaze/Support/AppPreferences.swift Kaze/Transcription/TranscriberProtocol.swift Kaze/Audio/MicrophoneCaptureSession.swift Kaze/Transcription/CloudflareTranscriber.swift Kaze/Data/RecordingVault.swift Tests/RecordingVaultTests.swift -o build/local/RecordingVaultTests
+build/local/RecordingVaultTests -cloudflareAccountID 0123456789abcdef0123456789abcdef
+```
 
 The bundle identifiers for this fork are `com.kavin.KazeCloud` and `com.kavin.KazeCloud.dev`. Change them before distributing the app if those identifiers do not belong to your organization.
 
