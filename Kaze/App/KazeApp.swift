@@ -11,6 +11,7 @@ struct KazeApp: App {
             ContentView(
                 historyManager: appDelegate.historyManager,
                 customWordsManager: appDelegate.customWordsManager,
+                recordingVault: appDelegate.recordingVault,
                 restartOnboarding: appDelegate.restartOnboarding
             )
             .frame(width: 760, height: 640)
@@ -26,11 +27,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var transcriber: CloudflareTranscriber?
     let historyManager = TranscriptionHistoryManager()
     let customWordsManager = CustomWordsManager()
+    let recordingVault = RecordingVault()
 
     private let hotkeyManager = HotkeyManager()
     private let overlayWindow = RecordingOverlayWindow()
     private let overlayState = OverlayState()
     private var statusItem: NSStatusItem?
+    private var recordingsMenuItem: NSMenuItem?
     private var cancellables = Set<AnyCancellable>()
     private var appearanceObservation: NSKeyValueObservation?
     /// Tracks the last icon name applied to the status bar button to prevent
@@ -99,6 +102,20 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             }
         }
         buildMenu()
+        recordingVault.onReady = { [weak self] id, text in
+            guard let self, self.activeSession?.transcriber.jobID == id else { return }
+            self.processTranscription(text)
+        }
+        recordingVault.onFailure = { [weak self] id, message, temporary in
+            guard let self, self.activeSession?.transcriber.jobID == id else { return }
+            self.handleTranscriptionFailure("\(message) Audio is saved in Settings → Recordings.\(temporary ? " Kaze will retry automatically." : " You can retry or export it there.")")
+        }
+        recordingVault.startRecovery()
+        recordingVault.$jobs.sink { [weak self] jobs in
+            let count = jobs.filter { $0.status == .ready || $0.status == .failed }.count
+            self?.recordingsMenuItem?.title = count == 0
+                ? "Saved Recordings…" : "Saved Recordings (\(count) to review)…"
+        }.store(in: &cancellables)
 
         // Release QA hook: renders the real production overlay without touching
         // the microphone, credentials, hotkey, or transcription pipeline.
@@ -173,6 +190,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let settingsItem = NSMenuItem(title: "Settings…", action: #selector(openSettings), keyEquivalent: ",")
         settingsItem.target = self
         menu.addItem(settingsItem)
+        let recordingsItem = NSMenuItem(title: "Saved Recordings…", action: #selector(openRecordings), keyEquivalent: "")
+        recordingsItem.target = self
+        menu.addItem(recordingsItem)
+        recordingsMenuItem = recordingsItem
         menu.addItem(NSMenuItem.separator())
         menu.addItem(NSMenuItem(title: "Quit Kaze", action: #selector(quit), keyEquivalent: "q"))
         statusItem?.menu = menu
@@ -251,7 +272,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     /// Called after onboarding completes or on subsequent launches.
     func requestPermissionsAndSetupHotkey() async {
         // Request microphone permission silently. If already granted, this returns immediately.
-        let transcriber = transcriber ?? CloudflareTranscriber()
+        let transcriber = transcriber ?? CloudflareTranscriber(vault: recordingVault)
         self.transcriber = transcriber
         _ = await transcriber.requestPermissions()
         setupHotkey()
@@ -266,6 +287,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     @objc private func openSettings() {
         openSettingsWindow(initialTab: .general)
+    }
+
+    @objc private func openRecordings() {
+        openSettingsWindow(initialTab: .recordings)
     }
 
     private func openSettingsWindow(initialTab: SettingsTab) {
@@ -310,6 +335,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         AnyView(ContentView(
             historyManager: historyManager,
             customWordsManager: customWordsManager,
+            recordingVault: recordingVault,
             restartOnboarding: restartOnboarding,
             initialTab: initialTab
         )
@@ -396,26 +422,19 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         guard !isSessionActive else { return }
         overlayState.processingStatusText = ""
 
-        // Cloudflare-hosted Whisper is the only engine in this fork. Validate credentials
-        // before activating the session so a configuration error cannot wedge the hotkey.
+        // Capture first, even if credentials are temporarily unavailable. The durable
+        // job can be retried after Keychain/account configuration is restored.
         let source = currentSourceApplication()
-
-        guard TranscriptionEngine.whisper.isConfigured else {
-            showTranscriptionError(
-                "Add a valid Cloudflare Account ID and API token before recording.",
-                openSettings: true
-            )
-            return
-        }
 
         let words = customWordsManager.words
         let micUID = selectedMicrophoneUID
-        let transcriber = transcriber ?? CloudflareTranscriber()
+        let transcriber = transcriber ?? CloudflareTranscriber(vault: recordingVault)
         self.transcriber = transcriber
         transcriber.customWords = words
         transcriber.selectedDeviceUID = micUID
-        transcriber.onTranscriptionFinished = { [weak self] text in
-            self?.processTranscription(text)
+        transcriber.onRecordingStopped = { [weak self] in
+            self?.overlayState.isEnhancing = true
+            self?.overlayState.processingStatusText = "Transcribing"
         }
         transcriber.onTranscriptionFailed = { [weak self] message in
             self?.handleTranscriptionFailure(message)
@@ -438,8 +457,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         activeSession?.endedAt = Date()
 
         session.transcriber.stopRecording()
-        overlayState.isEnhancing = true
-        overlayState.processingStatusText = "Transcribing"
     }
 
     private func processTranscription(_ rawText: String) {
@@ -468,7 +485,14 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
         let speechDuration = session?.speechDuration ?? 0
         let source = session?.source
-        typeText(cleanedText)
+        if let id = session?.transcriber.jobID {
+            do { try recordingVault.setTranscript(id: id, text: cleanedText) }
+            catch {
+                handleTranscriptionFailure("Could not save the final text before paste: \(error.localizedDescription)")
+                return
+            }
+        }
+        let pasteRequested = typeText(cleanedText)
         historyManager.addRecord(
             TranscriptionRecord(
                 text: cleanedText,
@@ -482,6 +506,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         isSessionActive = false
         activeSession = nil
         updateStatusItemIndicator()
+        if !pasteRequested {
+            showTranscriptionError("The transcript was saved, but Kaze could not post the paste shortcut. Open Saved Recordings to copy it.", openSettings: false)
+        }
     }
 
     private func handleTranscriptionFailure(_ message: String) {
@@ -502,19 +529,18 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
             let alert = NSAlert()
             alert.alertStyle = .warning
-            alert.messageText = "Whisper Transcription Failed"
+            alert.messageText = "Recording Needs Attention"
             alert.informativeText = message
-            alert.addButton(withTitle: openSettings ? "Open Settings" : "OK")
-            alert.runModal()
-
-            if openSettings {
-                self.openSettingsWindow(initialTab: .general)
+            alert.addButton(withTitle: openSettings ? "Open Settings" : "Saved Recordings")
+            alert.addButton(withTitle: "OK")
+            if alert.runModal() == .alertFirstButtonReturn {
+                self.openSettingsWindow(initialTab: openSettings ? .general : .recordings)
             }
         }
     }
 
-    private func typeText(_ text: String) {
-        guard !text.isEmpty else { return }
+    private func typeText(_ text: String) -> Bool {
+        guard !text.isEmpty else { return false }
         var output = text
         if UserDefaults.standard.bool(forKey: AppPreferenceKey.appendTrailingSpace) {
             output += " "
@@ -525,14 +551,19 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         pasteboard.clearContents()
         pasteboard.setString(output, forType: .string)
 
+        guard AXIsProcessTrusted() else { return false }
+
         let vKeyCode: CGKeyCode = 0x09
         let cmdDown = CGEvent(keyboardEventSource: source, virtualKey: vKeyCode, keyDown: true)
         cmdDown?.flags = .maskCommand
         let cmdUp = CGEvent(keyboardEventSource: source, virtualKey: vKeyCode, keyDown: false)
         cmdUp?.flags = .maskCommand
 
-        cmdDown?.post(tap: .cgAnnotatedSessionEventTap)
-        cmdUp?.post(tap: .cgAnnotatedSessionEventTap)
+        guard let cmdDown, let cmdUp else { return false }
+
+        cmdDown.post(tap: .cgAnnotatedSessionEventTap)
+        cmdUp.post(tap: .cgAnnotatedSessionEventTap)
+        return true // Posting is not proof the target accepted it; vault remains unconfirmed.
     }
 
     private func currentSourceApplication() -> TranscriptionSource? {
@@ -551,6 +582,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        if transcriber?.isRecording == true { transcriber?.stopRecording() }
         hotkeyManager.stop()
         cancellables.removeAll()
         if let hotkeyModeObserver {

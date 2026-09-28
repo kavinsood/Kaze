@@ -13,6 +13,7 @@ enum SettingsTab: String, CaseIterable, Identifiable {
     case vocabulary
     case stats
     case history
+    case recordings
     case debug
     case about
 
@@ -26,6 +27,7 @@ enum SettingsTab: String, CaseIterable, Identifiable {
         case .vocabulary: return "Vocabulary"
         case .stats: return "Stats"
         case .history: return "History"
+        case .recordings: return "Recordings"
         case .debug: return "Debug"
         case .about: return "About"
         }
@@ -39,6 +41,7 @@ enum SettingsTab: String, CaseIterable, Identifiable {
         case .vocabulary: return "text.book.closed"
         case .stats: return "chart.bar.xaxis"
         case .history: return "clock.arrow.circlepath"
+        case .recordings: return "waveform.badge.mic"
         case .debug: return "ladybug"
         case .about: return "info.circle"
         }
@@ -58,6 +61,7 @@ private enum AppVersion {
 struct ContentView: View {
     @ObservedObject var historyManager: TranscriptionHistoryManager
     @ObservedObject var customWordsManager: CustomWordsManager
+    @ObservedObject var recordingVault: RecordingVault
     let restartOnboarding: () -> Void
 
     @State private var selectedTab: SettingsTab? = .general
@@ -65,11 +69,13 @@ struct ContentView: View {
     init(
         historyManager: TranscriptionHistoryManager,
         customWordsManager: CustomWordsManager,
+        recordingVault: RecordingVault,
         restartOnboarding: @escaping () -> Void,
         initialTab: SettingsTab = .general
     ) {
         self.historyManager = historyManager
         self.customWordsManager = customWordsManager
+        self.recordingVault = recordingVault
         self.restartOnboarding = restartOnboarding
         _selectedTab = State(initialValue: initialTab)
     }
@@ -116,6 +122,8 @@ struct ContentView: View {
             StatsSettingsView(historyManager: historyManager)
         case .history:
             HistorySettingsView(historyManager: historyManager)
+        case .recordings:
+            RecordingRecoveryView(vault: recordingVault)
         case .debug:
             DebugSettingsView(restartOnboarding: restartOnboarding)
         case .about:

@@ -239,33 +239,21 @@ final class CloudflareTranscriber: ObservableObject, TranscriberProtocol {
     var customWords: [String] = []
     var onTranscriptionFinished: ((String) -> Void)?
     var onTranscriptionFailed: ((String) -> Void)?
+    var onRecordingStopped: (() -> Void)?
 
-    private let client: CloudflareTranscriptionClient
+    private let vault: RecordingVault
     private let microphoneCapture = MicrophoneCaptureSession()
-    private let bufferQueue = DispatchQueue(label: "com.kaze.cloudflare.audioBuffer")
-    private var audioBuffer: [Float] = []
-    private var inputSampleRate: Double = 16_000
-    private var durationLimitStopScheduled = false
-    private var transcriptionTask: Task<Void, Never>?
-    private var sessionConfiguration: SessionConfiguration?
+    private var writer: RecordingWriter?
+    private(set) var jobID: UUID?
+    private let captureIssueLock = NSLock()
+    private var captureFailureScheduled = false
+    private var captureIssue: String?
 
-    nonisolated private static let targetSampleRate: Double = 16_000
-    private static let maxRecordingSeconds: Double = 300
-    private static let initialBufferCapacity = 48_000 * 60
-
-    private struct SessionConfiguration {
-        let accountID: String
-        let apiToken: String
-        let language: String
-        let prompt: String?
-    }
-
-    init(client: CloudflareTranscriptionClient = .init()) {
-        self.client = client
+    init(vault: RecordingVault) {
+        self.vault = vault
     }
 
     deinit {
-        transcriptionTask?.cancel()
         let capture = microphoneCapture
         Task { @MainActor in capture.stop() }
     }
@@ -276,53 +264,39 @@ final class CloudflareTranscriber: ObservableObject, TranscriberProtocol {
 
     func startRecording() {
         guard !isRecording else { return }
-        transcriptionTask?.cancel()
-        transcriptionTask = nil
-
-        let accountID = UserDefaults.standard.string(forKey: AppPreferenceKey.cloudflareAccountID) ?? ""
-        let apiToken = KeychainManager.getCloudflareAPIToken() ?? ""
         let language = UserDefaults.standard.string(forKey: AppPreferenceKey.transcriptionLanguage) ?? "en"
-        sessionConfiguration = SessionConfiguration(
-            accountID: accountID,
-            apiToken: apiToken,
-            language: language,
-            prompt: Self.transcriptionPrompt(customWords: customWords)
-        )
-
-        bufferQueue.sync {
-            audioBuffer = []
-            audioBuffer.reserveCapacity(Self.initialBufferCapacity)
-            durationLimitStopScheduled = false
+        do {
+            let (job, newWriter) = try vault.begin(language: language,
+                prompt: Self.transcriptionPrompt(customWords: customWords))
+            jobID = job.id
+            writer = newWriter
+        } catch {
+            onTranscriptionFailed?("Could not create a local recording: \(error.localizedDescription)")
+            return
         }
         transcribedText = ""
         audioLevel = 0
+        isEnhancing = false
+        captureIssueLock.withLock {
+            captureFailureScheduled = false
+            captureIssue = nil
+        }
 
         microphoneCapture.stop()
         microphoneCapture.onAudioChunk = { [weak self] chunk in
             guard let self else { return }
-
-            let maxSamples = Int(chunk.sampleRate * Self.maxRecordingSeconds)
-            let shouldStopAtDurationLimit: Bool = self.bufferQueue.sync {
-                self.inputSampleRate = chunk.sampleRate
-                if self.audioBuffer.count < maxSamples {
-                    let remaining = maxSamples - self.audioBuffer.count
-                    self.audioBuffer.append(contentsOf: chunk.monoSamples.prefix(remaining))
-                }
-                if self.audioBuffer.count >= maxSamples && !self.durationLimitStopScheduled {
-                    self.durationLimitStopScheduled = true
-                    return true
-                }
-                return false
+            do {
+                try self.writer?.append(chunk.monoSamples, sampleRate: chunk.sampleRate)
+            } catch {
+                self.captureDidFail(error)
+                return
             }
-
             let level = Self.normalizedAudioLevel(from: chunk.monoSamples)
             Task { @MainActor [weak self] in
                 self?.audioLevel = level
-                if shouldStopAtDurationLimit, self?.isRecording == true {
-                    self?.stopRecording()
-                }
             }
         }
+        microphoneCapture.onCaptureError = { [weak self] error in self?.captureDidFail(error) }
 
         do {
             try microphoneCapture.start(deviceUID: selectedDeviceUID)
@@ -330,7 +304,11 @@ final class CloudflareTranscriber: ObservableObject, TranscriberProtocol {
         } catch {
             microphoneCapture.stop()
             isRecording = false
-            sessionConfiguration = nil
+            if let id = jobID, let writer {
+                try? vault.finish(id: id, writer: writer, warning: error.localizedDescription)
+            }
+            writer = nil
+            jobID = nil
             onTranscriptionFailed?("Could not start microphone recording: \(error.localizedDescription)")
         }
     }
@@ -339,54 +317,34 @@ final class CloudflareTranscriber: ObservableObject, TranscriberProtocol {
         guard isRecording else { return }
         microphoneCapture.stop()
         isRecording = false
-
-        let captured: ([Float], Double) = bufferQueue.sync {
-            let result = (audioBuffer, inputSampleRate)
-            audioBuffer = []
-            return result
-        }
-
-        guard !captured.0.isEmpty else {
-            sessionConfiguration = nil
-            onTranscriptionFailed?(CloudflareTranscriptionError.emptyAudio.localizedDescription)
-            return
-        }
-
-        guard let configuration = sessionConfiguration else {
-            onTranscriptionFailed?(CloudflareTranscriptionError.missingAPIToken.localizedDescription)
-            return
-        }
-        sessionConfiguration = nil
-
-        transcriptionTask?.cancel()
-        isEnhancing = true
-        transcriptionTask = Task { [weak self] in
-            guard let self else { return }
-            do {
-                let wavData = try await Task.detached(priority: .userInitiated) {
-                    try Self.makeWAVData(samples: captured.0, inputSampleRate: captured.1)
-                }.value
-                try Task.checkCancellation()
-
-                let text = try await client.transcribe(
-                    wavData: wavData,
-                    accountID: configuration.accountID,
-                    apiToken: configuration.apiToken,
-                    language: configuration.language,
-                    prompt: configuration.prompt
-                )
-                try Task.checkCancellation()
-
-                transcribedText = text
-                isEnhancing = false
-                onTranscriptionFinished?(text)
-            } catch is CancellationError {
-                isEnhancing = false
-                return
-            } catch {
-                isEnhancing = false
-                onTranscriptionFailed?(error.localizedDescription)
+        guard let id = jobID, let writer else { return }
+        self.writer = nil
+        let issue = captureIssueLock.withLock { captureIssue }
+        isEnhancing = issue == nil
+        do {
+            try vault.finish(id: id, writer: writer, warning: issue)
+            if let issue {
+                onTranscriptionFailed?("Recording stopped: \(issue). The captured portion is in Settings → Recordings.")
+            } else {
+                onRecordingStopped?()
             }
+        } catch {
+            isEnhancing = false
+            onTranscriptionFailed?("Could not finalize local recording: \(error.localizedDescription). Check Recordings in Settings.")
+        }
+    }
+
+    private func captureDidFail(_ error: Error) {
+        let shouldStop = captureIssueLock.withLock { () -> Bool in
+            guard !captureFailureScheduled else { return false }
+            captureFailureScheduled = true
+            captureIssue = error.localizedDescription
+            return true
+        }
+        guard shouldStop else { return }
+        Task { @MainActor [weak self] in
+            guard let self, self.isRecording else { return }
+            self.stopRecording()
         }
     }
 
@@ -395,82 +353,10 @@ final class CloudflareTranscriber: ObservableObject, TranscriberProtocol {
         return "Vocabulary: \(customWords.joined(separator: ", "))."
     }
 
-    private nonisolated static func makeWAVData(
-        samples: [Float],
-        inputSampleRate: Double
-    ) throws -> Data {
-        guard !samples.isEmpty else {
-            throw CloudflareTranscriptionError.emptyAudio
-        }
-
-        let resampled: [Float]
-        if abs(inputSampleRate - targetSampleRate) > 1 {
-            let ratio = targetSampleRate / inputSampleRate
-            let outputLength = Int(Double(samples.count) * ratio)
-            guard outputLength > 0 else {
-                throw CloudflareTranscriptionError.emptyAudio
-            }
-            var output = [Float](repeating: 0, count: outputLength)
-            var control = (0..<outputLength).map { Float(Double($0) / ratio) }
-            vDSP_vlint(
-                samples,
-                &control,
-                1,
-                &output,
-                1,
-                vDSP_Length(outputLength),
-                vDSP_Length(samples.count)
-            )
-            resampled = output
-        } else {
-            resampled = samples
-        }
-
-        var pcm = [Int16]()
-        pcm.reserveCapacity(resampled.count)
-        for sample in resampled {
-            let clamped = min(max(sample, -1), 1)
-            pcm.append(Int16(clamped * Float(Int16.max)).littleEndian)
-        }
-
-        let dataByteCount = pcm.count * MemoryLayout<Int16>.size
-        guard dataByteCount <= Int(UInt32.max) else {
-            throw CloudflareTranscriptionError.emptyAudio
-        }
-
-        var wav = Data(capacity: 44 + dataByteCount)
-        wav.appendASCII("RIFF")
-        wav.appendLittleEndian(UInt32(36 + dataByteCount))
-        wav.appendASCII("WAVE")
-        wav.appendASCII("fmt ")
-        wav.appendLittleEndian(UInt32(16))
-        wav.appendLittleEndian(UInt16(1))
-        wav.appendLittleEndian(UInt16(1))
-        wav.appendLittleEndian(UInt32(targetSampleRate))
-        wav.appendLittleEndian(UInt32(targetSampleRate * 2))
-        wav.appendLittleEndian(UInt16(2))
-        wav.appendLittleEndian(UInt16(16))
-        wav.appendASCII("data")
-        wav.appendLittleEndian(UInt32(dataByteCount))
-        pcm.withUnsafeBytes { wav.append(contentsOf: $0) }
-        return wav
-    }
-
     private nonisolated static func normalizedAudioLevel(from samples: [Float]) -> Float {
         guard !samples.isEmpty else { return 0 }
         var meanSquare: Float = 0
         vDSP_measqv(samples, 1, &meanSquare, vDSP_Length(samples.count))
         return min(sqrt(meanSquare) * 20, 1)
-    }
-}
-
-private nonisolated extension Data {
-    mutating func appendASCII(_ value: String) {
-        append(contentsOf: value.utf8)
-    }
-
-    mutating func appendLittleEndian<T: FixedWidthInteger>(_ value: T) {
-        var littleEndian = value.littleEndian
-        Swift.withUnsafeBytes(of: &littleEndian) { append(contentsOf: $0) }
     }
 }

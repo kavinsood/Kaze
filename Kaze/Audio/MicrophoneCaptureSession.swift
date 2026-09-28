@@ -8,6 +8,7 @@ enum MicrophoneCaptureError: LocalizedError {
     case inputCreationFailed
     case outputCreationFailed
     case unsupportedAudioFormat
+    case discontinuity
 
     var errorDescription: String? {
         switch self {
@@ -19,6 +20,8 @@ enum MicrophoneCaptureError: LocalizedError {
             return "Kaze could not create a capture output for the selected microphone."
         case .unsupportedAudioFormat:
             return "Kaze received an unsupported audio format from the microphone."
+        case .discontinuity:
+            return "The microphone dropped audio; the saved recording may contain a gap."
         }
     }
 }
@@ -31,6 +34,7 @@ final class MicrophoneCaptureSession: NSObject, AVCaptureAudioDataOutputSampleBu
     }
 
     var onAudioChunk: ((CapturedAudioChunk) -> Void)?
+    var onCaptureError: ((Error) -> Void)?
 
     private let sessionQueue = DispatchQueue(label: "com.kaze.capture.session")
     private let sampleBufferQueue = DispatchQueue(label: "com.kaze.capture.samples")
@@ -38,15 +42,22 @@ final class MicrophoneCaptureSession: NSObject, AVCaptureAudioDataOutputSampleBu
     private var captureSession = AVCaptureSession()
     private var audioOutput = AVCaptureAudioDataOutput()
     private var deviceInput: AVCaptureDeviceInput?
+    private var observers: [NSObjectProtocol] = []
+    // Only accessed from sampleBufferQueue.
+    private var expectedNextTimestamp: Double?
 
     func start(deviceUID: String?) throws {
         var thrownError: Error?
+        sampleBufferQueue.sync { expectedNextTimestamp = nil }
 
         sessionQueue.sync {
             do {
                 try configureSession(deviceUID: deviceUID)
+                observeCaptureFailures()
                 captureSession.startRunning()
+                if !captureSession.isRunning { throw MicrophoneCaptureError.deviceUnavailable }
             } catch {
+                removeObservers()
                 thrownError = error
             }
         }
@@ -58,6 +69,7 @@ final class MicrophoneCaptureSession: NSObject, AVCaptureAudioDataOutputSampleBu
 
     func stop() {
         sessionQueue.sync {
+            removeObservers()
             audioOutput.setSampleBufferDelegate(nil, queue: nil)
             if captureSession.isRunning {
                 captureSession.stopRunning()
@@ -77,6 +89,28 @@ final class MicrophoneCaptureSession: NSObject, AVCaptureAudioDataOutputSampleBu
         // Ensure no captured buffers are still waiting to be delivered before callers
         // close their transcription input stream.
         sampleBufferQueue.sync {}
+        expectedNextTimestamp = nil
+    }
+
+    private func observeCaptureFailures() {
+        removeObservers()
+        for name in [AVCaptureSession.runtimeErrorNotification,
+                     AVCaptureSession.wasInterruptedNotification] {
+            observers.append(NotificationCenter.default.addObserver(
+                forName: name, object: captureSession, queue: nil
+            ) { [weak self] notification in
+                let error = notification.userInfo?[AVCaptureSessionErrorKey] as? Error
+                    ?? NSError(domain: "KazeCapture", code: 1, userInfo: [
+                        NSLocalizedDescriptionKey: "The microphone capture session was interrupted."
+                    ])
+                self?.onCaptureError?(error)
+            })
+        }
+    }
+
+    private func removeObservers() {
+        observers.forEach { NotificationCenter.default.removeObserver($0) }
+        observers.removeAll()
     }
 
     private func configureSession(deviceUID: String?) throws {
@@ -135,9 +169,16 @@ final class MicrophoneCaptureSession: NSObject, AVCaptureAudioDataOutputSampleBu
     func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
         do {
             let (monoSamples, sampleRate) = try extractMonoSamples(from: sampleBuffer)
+            let timestamp = CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sampleBuffer))
+            let hasGap = timestamp.isFinite && expectedNextTimestamp.map {
+                abs(timestamp - $0) > 0.2
+            } == true
+            expectedNextTimestamp = timestamp.isFinite
+                ? timestamp + Double(monoSamples.count) / sampleRate : nil
             onAudioChunk?(CapturedAudioChunk(sampleBuffer: sampleBuffer, monoSamples: monoSamples, sampleRate: sampleRate))
+            if hasGap { onCaptureError?(MicrophoneCaptureError.discontinuity) }
         } catch {
-            return
+            onCaptureError?(error)
         }
     }
 
